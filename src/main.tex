@@ -1,0 +1,250 @@
+\documentclass{article}
+
+\usepackage{ragged2e}
+\usepackage{pgfplots}
+    \pgfplotsset{compat=newest}
+    \usepgfplotslibrary{fillbetween}
+    \pgfplotsset{
+        cycle list={[colors of colormap={0,125,...,1000}]}
+    }
+\usepackage{amsmath}
+\usepackage{amsfonts}
+
+\title{A thorough reproduction of $\mu$P}
+\author{
+Georgios Vlassis\\
+gvlassis@ethz.ch
+\and
+David Belius\\
+david.belius@unidistance.ch
+}
+\date{\today}
+
+\begin{document}
+\maketitle
+
+\section{Abstract}
+Under the so-called Standard Parametrization (SP), the weights of Neural Networks are initialized from the Gaussian distribution $\mathcal{N}(0,\frac{1}{fan-in})$, and the learning rate of every layer is the same. While this guarantees that (pre)activations are $\mathcal{O}(1)$ at initialization with respect to width, it causes them to be width-dependent during training, often leading to divergence for wide networks. To address this, \cite{yang2020feature} and \cite{yang2021tuning} proposed the Maximal Update Parametrization ($\mu$P), which is also claimed to stabilize certain optimal hyperparameters irrespective of width. However, despite its alleged benefits, $\mu$P has not gained much traction among practitioners. Likely, this is because $\mu$P has not been thoroughly tested against SP. We will attempt to circumvent this by independently reproducing the claims of \cite{yang2020feature} and \cite{yang2021tuning}. At the same time, we substantially increase the scale of the experiments by training more than 10,000 Neural Networks, of sizes up to 0.5B parameters, and offer new insights into $\mu$P, regarding its effect on validation loss, training stability, gradients and weights. We find that $\mu$P indeed delivers on its promises, even though this does not always directly translate to improved generalization.
+
+\section{Introduction}
+\subsection{Related works}
+Deep Learning researchers and practitioners have long understood the importance of initialization and its connection with width. \cite{lecun2002efficient} advocated that weights be sampled from a distribution with $\mu=0$ and $\sigma=\frac{1}{\sqrt{fan-in}}$ (LeCun initialization). \cite{glorot2010understanding} shed further light to why this is helpful, and \cite{sutskever2013importance} showed that initialization schemes like this can synergize with momentum methods. Even though all of these works were based on logistic activation functions, which were later mostly abandoned in favor of the Rectified Linear Unit (ReLU), they highlighted that the relationship between initialization and width is a crucial one.
+
+\cite{yang2020feature} recognized that LeCun initialization ensures that (pre)activations are $\mathcal{O}(1)$ in the beginning of training, but this property is lost during training, which can cause wide networks to diverge. Starting from the desideratum that (pre)activations are $\mathcal{O}(1)$ throughout training, and using the theory developed in the Tensor Programs (TP) series of papers (\cite{yang2019scaling}, \cite{yang2019wide}, \cite{yang2020tensor}, \cite{yang2021tensor}, \cite{yang2020tensor2}, \cite{yang2020feature}, \cite{littwin2022adaptive}, \cite{yang2023spectral}, \cite{yang2021tuning}, \cite{yang2023feature}), \cite{yang2020feature} arrive at the $\mu$P. $\mu$P is also said to stabilize many optimal hyperparameters even as width changes, a property that is exploited in \cite{yang2021tuning} for hyperparameter tuning. In this paradigm, called $\mu$Transfer, optimal hyperparameters are discovered cheaply for a small, proxy network, and then zero-shot transfered to a big, target network.
+
+Since its proposal, $\mu$P has been used in a number of works. For the case of Large Language Models (LLMs), it has been used by \cite{dey2023cerebras} (Cerebras-GPT), \cite{li2023flm} (FLM-101B), \cite{dey2023btlm} (BTLM-3B-8K), \cite{liu2023llm360} (CrystalCoder), \cite{hu2024minicpm} (MiniCPM), along with Bayesian Optimization and \cite{li2024tele} (Tele-FLM). Perhaps the most interesting case is the one of \cite{achiam2023gpt} (GPT-4), which includes \cite{yang2021tensor} in the references without explicitly citing it. This raises the question about how many works use $\mu$P without disclosing it. Outside of the LLM world, \cite{cabannes2023associative} used it for the design of their experiments and \cite{beaini2023towards} used it in the Graphium GNN.
+
+\subsection{Objectives}
+Going through the above works, one will notice that the benefits of $\mu$P are nearly always assumed a priori. The authors, take at face value that $\mu$P is preferable over SP and do not ablate with respect to the parameterization. Besides the original papers (\cite{yang2020feature} and \cite{yang2021tuning}), the only work that investigates the claimed advantages of $\mu$P over SP is \cite{lingle2024large}. \cite{lingle2024large} studies whether $\mu$P indeed stabilizes the optimal learning rate and whether it leads to better generalization. However, it is only about the Transformer architecture and only for the language modelling task.
+
+In this paper, we will thoroughly investigate the alleged benefits of $\mu$P, and compare it head-to-head with SP. We moreover expand the scale of the existing $\mu$P studies (\cite{yang2020feature}, \cite{yang2021tuning} and \cite{lingle2024large}), by including 4 architectures across 3 tasks, scaling to narrower and wider networks, performing a denser hyperparameter sweep, training for more random seeds and training for longer. In total, we train 10,240 networks, with a maximum size of 0.5B parameters. We also offer insights about the effect of $\mu$P on the validation loss, the training stability, the gradients of the weights, as well as the weights themselves. Our ultimate goal is to figure out whether and to what extend the alluring promises of $\mu$P hold in practise, and if and when it should be prefered over SP.
+
+As our work is fundamentally a reproducibility study of \cite{yang2020feature} and \cite{yang2021tuning}, we made every effort that our results are reproducible themselves. The \textit{complete} repositories of the training code and the paper (data+figures), along with detailed instructions about how to use them, are already available online.
+
+\subsection{Findings}
+Our findings, in the order they will be discussed in the paper, can be summarized as follows:
+\begin{enumerate}
+    \item Plotting the norm of coordinate-wise outputs, gradients and weights reveals that they are all $\mathcal{O}(1)$, under $\mu$P, while heavily depending on width under SP.
+reveals that activations, while they depend on width in SP
+    \item In $\mu$P, and unlike SP, the optimal (with respect to the training loss) learning rate indeed stays \textit{approximately} constant even as width increases. Thus, $\mu$Transfer, in contrast to "naive" hyperparameter tuning with SP, opens the door for zero-shot hyperparameter transfer, from narrow (and thus cheaply trainable) networks to wide ones.
+    \item Under $\mu$P, wider networks \textit{in general} outperform (in training loss) narrower networks. This trend is much less visible, although still present, under SP.
+    \item The above two points do not translate to the validation loss when there is overfitting. Furthermore, the optimal $\mu$P network does not \textit{always} generalize better than the optimal SP network.
+    \item With SP, we observed some wide networks diverging. Specifically, the wider the network, the more likely it was to diverge. In contrast, none of the networks diverged with $\mu$P.
+\end{enumerate}
+
+In summary, we found that $\mu$P \textit{mostly} performs as expected. Given that it is also theoretically sound, we think that its benefits outweight its (low) implementation cost, and should thus be added to the toolbox of the aspiring Deep Learning practitioner.
+
+\section{$\mu$P primer}
+
+\begin{align}
+    W &\in\mathbb{R}^{d_{in}\times\ d_{out}}\\
+    W &\sim \mathcal{N}(0, \kappa\gamma)\\
+    W &\leftarrow W - \eta \zeta \times \nabla W
+\end{align}
+
+\begin{table}
+\Centering
+\caption{muP}
+\begin{tabular}{lccc}
+\hline
+test & $d_{in}\to\infty$ & $d_{in},d_{out}\to\infty$ & $d_{out}\to\infty$ \\
+\hline
+$\gamma$ & $\frac{1}{\sqrt{d_{in}}}$ & $\frac{1}{\sqrt{d_{in}}}$ & $\frac{1}{d_{in}}$ \\ 
+    $\zeta$ & $d_{out}$ & $\frac{1}{d_{in}}$ & 1 \\
+\hline
+\end{tabular}
+\end{table}
+
+\section{Verifying the $\mu$P implementation}
+
+\section{Experimental setup}
+
+\subsection{MLP on}
+
+\subsection{VGG on CIFAR-10}
+We trained a modified VGG11 {\color{red}[citation]} on the Cifar10 dataset of varying width and varying the learning rate.
+
+{\color{red} Double check all numbers below}
+The original VGG11 architecture takes as input images of resolution $224\times244$ with three RGB channels, which pass through five VGG blocks, each of which reduces the resolution by a factor two and doubles the number of channels. The output of the last VGG block is flattened and passed through three fully connected of width $7\times7\times512$, ending with a 1000-way softmax.
+
+We adapted the architecture to Cifar10 with its  $32\times32$ resolution and three channels by reducing the number of VGG blocks to four. The output of the first block has resolution $16 \times 16$ and $64$ channels. The remaining three blocks halve the resolution, and double the number of channels, so that the output of final block has resolution $2x2$ and $512$ channels. The three fully connected layers have width $2\times2\times512=2048$, and the output layer is softmax with $10$ outputs.
+
+We also modified the architecture by changing the width. We multiplied the number of channels of each convolutional layer and the width of each fully connected layer by $\theta/4$ for $\theta \in {1,2,4,\ldots,128}$. Note that $\theta=4$ corresponds to the original width of our modified VGG.
+
+For each $\theta$ we trained the modified VGG11 using the standard parametrization and the $mu$P-parametrization. For experiments we trained for $50 000$ batches of size $32$ using the adam optimizer and dropout with parameter $p=0.5$.
+
+\subsection{ViT on CIFAR-10}
+
+\subsection{Transformer on}
+
+\section{Results}
+\subsection{MLP on}
+
+\subsection{VGG on CIFAR-10}
+The results for the modified VGG11 trained on Cifar10 are presented in Figure, which for each width $\theta$ shows the train and test losses at the end of training as a function of learning rate, for both standard and $\mu$P parametrizations. The claims of [muP] paper are borne out: with $\mu$P-parametrization both train and validation loss decrease essentially monotonically in the width, and furthermore the optimal learning rate is similar at each width. By contrast, with the standard parametrization only {\color{red}some learning rates show montonic decrease of final losses.}
+
+Plot with x axis is {LR, init var multiplier} and  and y axis is test loss, one curve per width.
+
+\begin{figure}[!h]
+\Centering
+
+\begin{tikzpicture}
+    \begin{axis}[xmin=0, xmax=1, ymin=0, ymax=1, legend columns=8, legend style={at={(0.5,1)},anchor=south}, hide axis, scale only axis, width=1mm]
+    \foreach \θ in {1,2,4,8,16,32,64,128}{
+        \addplot+[mark=none] coordinates {(0,0)};
+        \expandafter\addlegendentry\expandafter{\θ}
+    }
+\end{axis}
+\end{tikzpicture}
+
+\begin{tikzpicture}
+\begin{axis}[xlabel=lr, ylabel=min\_train\_loss, xmode=log, scale=0.7]
+    \foreach \θ in {1,2,4,8,16,32,64,128}{
+        \addplot table [x=lr, y=min_train_loss_mean] {../vgg/sp/θ=\θ/summary.dat};
+        \pgfplotsset{cycle list shift=-1}
+        \addplot+[name path=top, opacity=0, forget plot] table [x=lr, y=min_train_loss_top] {../vgg/sp/θ=\θ/summary.dat};
+        \addplot+[name path=bot, opacity=0, forget plot] table [x=lr, y= min_train_loss_bot] {../vgg/sp/θ=\θ/summary.dat};
+        \addplot+[opacity=3/8, forget plot] fill between [of=top and bot];
+        \pgfplotsset{cycle list shift=0}
+    }
+\end{axis}
+\end{tikzpicture}
+%
+\begin{tikzpicture}
+\begin{axis}[xlabel=lr, ylabel=min\_val\_loss, xmode=log, scale=0.7]
+    \foreach \θ in {1,2,4,8,16,32,64,128}{
+        \addplot table [x=lr, y=min_val_loss_mean] {../vgg/sp/θ=\θ/summary.dat};
+        \pgfplotsset{cycle list shift=-1}
+        \addplot+[name path=top, opacity=0, forget plot] table [x=lr, y=min_val_loss_top] {../vgg/sp/θ=\θ/summary.dat};
+        \addplot+[name path=bot, opacity=0, forget plot] table [x=lr, y= min_val_loss_bot] {../vgg/sp/θ=\θ/summary.dat};
+        \addplot+[opacity=3/8, forget plot] fill between [of=top and bot];
+        \pgfplotsset{cycle list shift=0}
+    }
+\end{axis}
+\end{tikzpicture}
+%
+\begin{tikzpicture}
+\begin{axis}[xlabel=lr, ylabel=min\_train\_loss, xmode=log, scale=0.7]
+    \foreach \θ in {1,2,4,8,16,32,64,128}{
+        \addplot table [x=lr, y=min_train_loss_mean] {../vgg/mup/θ=\θ/summary.dat};
+        \pgfplotsset{cycle list shift=-1}
+        \addplot+[name path=top, opacity=0, forget plot] table [x=lr, y=min_train_loss_top] {../vgg/mup/θ=\θ/summary.dat};
+        \addplot+[name path=bot, opacity=0, forget plot] table [x=lr, y= min_train_loss_bot] {../vgg/mup/θ=\θ/summary.dat};
+        \addplot+[opacity=3/8, forget plot] fill between [of=top and bot];
+        \pgfplotsset{cycle list shift=0}
+    }
+\end{axis}
+\end{tikzpicture}
+%
+\begin{tikzpicture}
+\begin{axis}[xlabel=lr, ylabel=min\_val\_loss, xmode=log, scale=0.7]
+    \foreach \θ in {1,2,4,8,16,32,64,128}{
+        \addplot table [x=lr, y=min_val_loss_mean] {../vgg/mup/θ=\θ/summary.dat};
+        \pgfplotsset{cycle list shift=-1}
+        \addplot+[name path=top, opacity=0, forget plot] table [x=lr, y=min_val_loss_top] {../vgg/mup/θ=\θ/summary.dat};
+        \addplot+[name path=bot, opacity=0, forget plot] table [x=lr, y= min_val_loss_bot] {../vgg/mup/θ=\θ/summary.dat};
+        \addplot+[opacity=3/8, forget plot] fill between [of=top and bot];
+        \pgfplotsset{cycle list shift=0}
+    }
+\end{axis}
+\end{tikzpicture}
+
+\caption{VGG}
+\end{figure}
+
+\subsection{ViT on CIFAR-10}
+\begin{figure}[!h]
+\Centering
+
+\begin{tikzpicture}
+    \begin{axis}[xmin=0, xmax=1, ymin=0, ymax=1, legend columns=8, legend style={at={(0.5,1)},anchor=south}, hide axis, scale only axis, width=1mm]
+    \foreach \θ in {1,2,4,8,16,32,64,128}{
+        \addplot+[mark=none] coordinates {(0,0)};
+        \expandafter\addlegendentry\expandafter{\θ}
+    }
+\end{axis}
+\end{tikzpicture}
+
+\begin{tikzpicture}
+\begin{axis}[xlabel=lr, ylabel=min\_train\_loss, xmode=log, scale=0.65]
+    \foreach \θ in {1,2,4,8,16,32,64,128}{
+        \addplot table [x=lr, y=min_train_loss_mean] {../vit/sp/θ=\θ/summary.dat};
+        \pgfplotsset{cycle list shift=-1}
+        \addplot+[name path=top, opacity=0, forget plot] table [x=lr, y=min_train_loss_top] {../vit/sp/θ=\θ/summary.dat};
+        \addplot+[name path=bot, opacity=0, forget plot] table [x=lr, y= min_train_loss_bot] {../vit/sp/θ=\θ/summary.dat};
+        \addplot+[opacity=3/8, forget plot] fill between [of=top and bot];
+        \pgfplotsset{cycle list shift=0}
+    }
+\end{axis}
+\end{tikzpicture}
+%
+\begin{tikzpicture}
+\begin{axis}[xlabel=lr, ylabel=min\_val\_loss, xmode=log, scale=0.65]
+    \foreach \θ in {1,2,4,8,16,32,64,128}{
+        \addplot table [x=lr, y=min_val_loss_mean] {../vit/sp/θ=\θ/summary.dat};
+        \pgfplotsset{cycle list shift=-1}
+        \addplot+[name path=top, opacity=0, forget plot] table [x=lr, y=min_val_loss_top] {../vit/sp/θ=\θ/summary.dat};
+        \addplot+[name path=bot, opacity=0, forget plot] table [x=lr, y= min_val_loss_bot] {../vit/sp/θ=\θ/summary.dat};
+        \addplot+[opacity=3/8, forget plot] fill between [of=top and bot];
+        \pgfplotsset{cycle list shift=0}
+    }
+\end{axis}
+\end{tikzpicture}
+%
+\begin{tikzpicture}
+\begin{axis}[xlabel=lr, ylabel=min\_train\_loss, xmode=log, scale=0.65]
+    \foreach \θ in {1,2,4,8,16,32,64,128}{
+        \addplot table [x=lr, y=min_train_loss_mean] {../vit/mup/θ=\θ/summary.dat};
+        \pgfplotsset{cycle list shift=-1}
+        \addplot+[name path=top, opacity=0, forget plot] table [x=lr, y=min_train_loss_top] {../vit/mup/θ=\θ/summary.dat};
+        \addplot+[name path=bot, opacity=0, forget plot] table [x=lr, y= min_train_loss_bot] {../vit/mup/θ=\θ/summary.dat};
+        \addplot+[opacity=3/8, forget plot] fill between [of=top and bot];
+        \pgfplotsset{cycle list shift=0}
+    }
+\end{axis}
+\end{tikzpicture}
+%
+\begin{tikzpicture}
+\begin{axis}[xlabel=lr, ylabel=min\_val\_loss, xmode=log, scale=0.65]
+    \foreach \θ in {1,2,4,8,16,32,64,128}{
+        \addplot table [x=lr, y=min_val_loss_mean] {../vit/mup/θ=\θ/summary.dat};
+        \pgfplotsset{cycle list shift=-1}
+        \addplot+[name path=top, opacity=0, forget plot] table [x=lr, y=min_val_loss_top] {../vit/mup/θ=\θ/summary.dat};
+        \addplot+[name path=bot, opacity=0, forget plot] table [x=lr, y= min_val_loss_bot] {../vit/mup/θ=\θ/summary.dat};
+        \addplot+[opacity=3/8, forget plot] fill between [of=top and bot];
+        \pgfplotsset{cycle list shift=0}
+    }
+\end{axis}
+\end{tikzpicture}
+
+\caption{ViT}
+\end{figure}
+
+\subsection{Transformer on}
+
+\section{Conclusion}
+
+\bibliographystyle{plain}
+\bibliography{main.bib}
+
+\end{document}

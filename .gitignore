@@ -1,0 +1,8 @@
+vgg
+vit
+.DS_Store
+src/main.aux
+src/main.bbl
+src/main.blg
+src/main.log
+src/main.pdf
